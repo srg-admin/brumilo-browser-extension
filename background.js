@@ -10,7 +10,44 @@ const TRANSACTIONS_URL = 'https://www.amazon.com/cpe/yourpayments/transactions';
 const BRUMILO = [/^https:\/\/app(-dev)?\.brumilo\.com\//, /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//];
 const PAGE_TIMEOUT_MS = 30000;
 
+// How far a bank charge can fall from Amazon's charge date, and how far its
+// amount can be off (tax rounded item by item) - a little wider than the
+// server's match, so the final say stays with the server.
+const DAYS_BEFORE = 3;
+const DAYS_AFTER = 10;
+const LEEWAY_CENTS = 3;
+
 let current = null; // { port, tabId }
+
+function shiftDate(date, days) {
+    const d = new Date(`${date}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+}
+
+// Is there an open charge (one in the books without details) for this
+// amount, posted from `first` to `last` (YYYY-MM-DD) of Amazon's charges?
+function hasOpenCharge(open, cents, first, last) {
+    const from = shiftDate(first, -DAYS_BEFORE);
+    const to = shiftDate(last, DAYS_AFTER);
+    return open.some((o) => Math.abs(o.cents - cents) <= LEEWAY_CENTS && o.date >= from && o.date <= to);
+}
+
+// The order IDs worth opening: those with a card charge - or all of them
+// together, as the server tries the whole order first - that an open charge
+// in the books could be. `charges` is Map(orderId => [{ date, cents }]).
+function ordersToRead(charges, open) {
+    const wanted = [];
+    for (const [id, paid] of charges) {
+        const dates = paid.map((c) => c.date).sort();
+        const total = paid.reduce((sum, c) => sum + c.cents, 0);
+        if (paid.some((c) => hasOpenCharge(open, c.cents, c.date, c.date)) || hasOpenCharge(open, total, dates[0], dates.at(-1))) {
+            wanted.push(id);
+        }
+    }
+    // Newest charge first, like Your Orders.
+    return wanted.sort((a, b) => charges.get(b).at(-1).date.localeCompare(charges.get(a).at(-1).date));
+}
 
 // Resolves once the tab's next page has loaded (or after a timeout).
 function nextLoad(tabId) {
@@ -52,7 +89,9 @@ function tell(port, message) {
 
 const stillWanted = (port) => current?.port === port;
 
-async function sync(port, since) {
+// `open`: the charges in the books still without details, or null to read
+// every order in the period.
+async function sync(port, since, open) {
     const loaded = new Promise((resolve) => {
         chrome.tabs.create({ url: ORDERS_URL, active: false }, (tab) => {
             current = { port, tabId: tab.id };
@@ -74,9 +113,14 @@ async function sync(port, since) {
     };
 
     try {
-        const listed = await inAmazon(tab.id, (from) => brumiloAmazon.listOrders(from), [since]);
-        console.log('Brumilo Amazon sync - listing', { since, listed: listed?.orders?.length }, (listed?.log ?? []).join('\n'));
-        if (await needsUser(listed)) return;
+        // Your Orders is only paged through to know which orders to read; the
+        // card charges name their orders too, so with `open` it's not needed.
+        let listed = { orders: [] };
+        if (!open) {
+            listed = await inAmazon(tab.id, (from) => brumiloAmazon.listOrders(from), [since]);
+            console.log('Brumilo Amazon sync - listing', { since, listed: listed?.orders?.length }, (listed?.log ?? []).join('\n'));
+            if (await needsUser(listed)) return;
+        }
 
         tell(port, { type: 'progress', message: 'Reading card charges…' });
         await open(tab.id, TRANSACTIONS_URL);
@@ -88,11 +132,18 @@ async function sync(port, since) {
         }
         console.log('Brumilo Amazon sync - charges', { charges: paid?.charges?.length, orders: charges.size });
 
+        // Charges can be for orders placed before `since`, so with `open`
+        // the order's own date isn't held to it.
+        const toRead = open ? ordersToRead(charges, open).map((id) => ({ id, date: null })) : listed.orders;
+        if (open) {
+            console.log('Brumilo Amazon sync - reading only orders with an open charge', { open: open.length, orders: toRead.length });
+        }
+
         const orders = [];
         let skipped = 0;
-        for (const [i, { id, date }] of listed.orders.entries()) {
+        for (const [i, { id, date }] of toRead.entries()) {
             if (!stillWanted(port)) return;
-            tell(port, { type: 'progress', message: `Reading order ${i + 1} of ${listed.orders.length}…` });
+            tell(port, { type: 'progress', message: `Reading order ${i + 1} of ${toRead.length}…` });
 
             await open(tab.id, ORDER_URL + encodeURIComponent(id));
             const read = await inAmazon(tab.id, (orderId, listedDate) => brumiloAmazon.readOrder(orderId, listedDate), [id, date]);
@@ -101,7 +152,7 @@ async function sync(port, since) {
             if (!read?.order) {
                 console.log('Brumilo Amazon sync - could not read', id);
                 skipped++;
-            } else if (read.order.order_date < since) {
+            } else if (!open && read.order.order_date < since) {
                 break; // Newest first, so the rest are older still.
             } else {
                 orders.push({ ...read.order, charges: charges.get(id) ?? read.order.charges });
@@ -109,7 +160,7 @@ async function sync(port, since) {
         }
 
         console.log('Brumilo Amazon sync - done', { read: orders.length, skipped });
-        tell(port, { type: 'done', orders, skipped, listed: listed.orders.length });
+        tell(port, { type: 'done', orders, skipped, listed: toRead.length });
     } catch (e) {
         console.error('Brumilo Amazon sync failed', e);
         tell(port, { type: 'error', error: 'failed', message: `Couldn't read your Amazon orders (${e.message}).` });
@@ -125,7 +176,7 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
     }
 
-    port.onMessage.addListener(({ since }) => {
+    port.onMessage.addListener(({ since, open }) => {
         if (current) {
             port.postMessage({ type: 'error', error: 'busy', message: 'A sync is already running in another tab.' });
             return;
@@ -134,7 +185,8 @@ chrome.runtime.onConnect.addListener((port) => {
             port.postMessage({ type: 'error', error: 'failed', message: 'No start date for the sync.' });
             return;
         }
-        sync(port, since);
+        const validOpen = Array.isArray(open) && open.every((o) => /^\d{4}-\d{2}-\d{2}$/.test(o?.date ?? '') && Number.isInteger(o?.cents));
+        sync(port, since, validOpen ? open : null);
     });
 
     // The Brumilo tab went away - stop reading Amazon.

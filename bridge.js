@@ -20,7 +20,7 @@ function connected() {
 
 window.addEventListener('message', (e) => {
     if (e.source !== window || e.origin !== window.location.origin || e.data?.source !== PAGE) return;
-    const { type, id, since } = e.data;
+    const { type, id, since, open } = e.data;
 
     if (!connected()) {
         if (type === 'amazon-sync') {
@@ -55,6 +55,6 @@ window.addEventListener('message', (e) => {
                 reply({ type: 'error', id, error: 'stopped', message: 'The extension stopped before it finished. Try again.' });
             }
         });
-        port.postMessage({ since });
+        port.postMessage({ since, open });
     }
 });
