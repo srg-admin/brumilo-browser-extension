@@ -23,6 +23,7 @@
     const LONG_DATE = '([A-Z][a-z]+ \\d{1,2}, \\d{4})';
     const PAUSE_MS = 700;
     const WAIT_FOR_PAGE_MS = 8000;
+    const STALLS_BEFORE_GIVING_UP = 3;
     const SIGNED_OUT = 'signed-out';
     const BLOCKED = 'blocked';
 
@@ -187,9 +188,27 @@
             .map((t) => ({ date: t.date, cents: t.charged && t.orderIds.length === 1 ? t.cents : 0, orderId: t.orderIds.length === 1 ? t.orderIds[0] : null }));
     }
 
+    // Scrolls to the last charge listed so far: the window, and any panel around
+    // the charges that scrolls on its own (window.scrollTo does nothing to those),
+    // then the last charge itself into view.
+    function scrollToEnd() {
+        const rows = document.querySelectorAll('[data-testid="transaction-link-content-wrapper"]');
+        const last = rows[rows.length - 1];
+        const panels = new Set([document.scrollingElement ?? document.documentElement]);
+        for (let el = last?.parentElement; el; el = el.parentElement) {
+            if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight) panels.add(el);
+        }
+        panels.forEach((panel) => {
+            panel.scrollTop = 0;
+            panel.scrollTop = panel.scrollHeight;
+        });
+        last?.scrollIntoView({ block: 'end' });
+        last?.dispatchEvent(new WheelEvent('wheel', { deltaY: 800, bubbles: true }));
+    }
+
     // Reads the transactions page open in this tab, scrolling to load more
     // until it reaches charges from before `since` or runs out. Returns
-    // { charges: [{ date, cents, orderId }] }, { signedOut } or { blocked }.
+    // { charges: [{ date, cents, orderId }], oldest }, { signedOut } or { blocked }.
     async function readTransactions(since) {
         if (location.pathname.startsWith('/ap/') || isSignInPage(document)) return { signedOut: true };
         if (isRobotCheck(document)) return { blocked: true };
@@ -199,7 +218,10 @@
             await pause(250);
         }
 
-        for (let rounds = 0; rounds < 100; rounds++) {
+        // A slow load looks like the end of the list, so a stall is tried a few
+        // times - nudging the page again each time - before it's taken as one.
+        let stalls = 0;
+        for (let rounds = 0; rounds < 300; rounds++) {
             const listed = listedCharges(document);
             const oldest = listed.map((t) => t.date).sort()[0];
             progress(`Reading card charges… (back to ${oldest ?? 'now'})`);
@@ -208,7 +230,10 @@
             const before = count();
             const more = [...document.querySelectorAll('button, [role="button"], a')].find((el) => /^next page$/i.test(textOf(el)));
             if (more) more.click();
-            window.scrollTo(0, document.body.scrollHeight);
+            scrollToEnd();
+            // For a page that listens for the wheel or scroll rather than watching what's in view.
+            document.dispatchEvent(new WheelEvent('wheel', { deltaY: 800, bubbles: true }));
+            window.dispatchEvent(new Event('scroll'));
             document.querySelector('[data-testid="LoadingViewFacadeTestID"]')?.scrollIntoView();
 
             let waited = 0;
@@ -216,10 +241,16 @@
                 await pause(300);
                 waited += 300;
             }
-            if (count() === before) break;
+            if (count() > before) {
+                stalls = 0;
+            } else if (++stalls >= STALLS_BEFORE_GIVING_UP) {
+                break;
+            }
         }
 
-        return { charges: listedCharges(document).filter((t) => t.cents > 0 && t.orderId && t.date >= since) };
+        // `oldest` is how far back the page got - past `since`, or short of it.
+        const oldest = listedCharges(document).map((t) => t.date).sort()[0] ?? null;
+        return { charges: listedCharges(document).filter((t) => t.cents > 0 && t.orderId && t.date >= since), oldest };
     }
 
     globalThis.brumiloAmazon = { listOrders, readTransactions, readOrder, parseOrder, listedOrders, listedCharges };
